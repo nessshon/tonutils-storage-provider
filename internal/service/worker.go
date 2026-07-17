@@ -33,7 +33,7 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 	stopCtx, stop := context.WithCancel(s.globalCtx)
 	defer stop()
 
-	drop := func() {
+	drop := func(reason db.StoredBagStopReason) {
 		stop()
 
 		wait := time.Duration(0)
@@ -85,15 +85,14 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 					log.Info().Str("addr", contractAddr.String()).Hex("bag", bagId).Str("another_contract", usedByAnother).Msg("bag is not removed, used by another contract")
 				}
 
-				if err := s.db.SetContract(db.StoredBag{
-					BagID:        bagId,
-					Size:         0,
-					ContractAddr: contractAddr.String(),
-					Status:       db.StoredBagStatusStopped,
-				}); err != nil {
+				if err := s.markContractStopped(contractAddr.String(), bagId, info, reason); err != nil {
 					return fmt.Errorf("failed to update contract in db: %w", err)
 				}
-				log.Info().Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("storage for contract stopped")
+				log.Info().
+					Str("addr", contractAddr.String()).
+					Hex("bag", bagId).
+					Str("reason", string(reason)).
+					Msg("storage for contract stopped")
 				return nil
 			}(); err != nil {
 				log.Error().Err(err).Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("failed to set stopped contract to db, will be retried")
@@ -228,7 +227,7 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 							Hex("bag", bagId).
 							Msg("contract is not genuine, dropping")
 
-						drop()
+						drop(db.StoredBagStopReasonInvalidContract)
 						continue
 					}
 
@@ -241,7 +240,7 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 							Hex("bag", bagId).
 							Msg("bag size is too big, dropping")
 
-						drop()
+						drop(db.StoredBagStopReasonBagTooBig)
 						continue
 					}
 
@@ -296,7 +295,7 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 							Hex("bag", bagId).
 							Msg("no download progress for too long, dropping")
 
-						drop()
+						drop(db.StoredBagStopReasonDownloadStalled)
 						continue
 					}
 
@@ -336,7 +335,7 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 				if errors.Is(err, contract.ErrProviderNotFound) {
 					log.Warn().Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("provider was removed by the owner, dropping storage")
 
-					drop()
+					drop(db.StoredBagStopReasonProviderRemoved)
 					return nil
 				}
 				return fmt.Errorf("failed to get provider info: %w", err)
@@ -346,21 +345,21 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 				if pi.MaxSpan < s.minSpan {
 					log.Warn().Str("addr", contractAddr.String()).Uint32("span", pi.MaxSpan).Hex("bag", bagId).Msg("too short span, dropping storage")
 
-					drop()
+					drop(db.StoredBagStopReasonShortSpan)
 					return nil
 				}
 
 				if pi.MaxSpan > s.maxSpan {
 					log.Warn().Str("addr", contractAddr.String()).Uint32("span", pi.MaxSpan).Hex("bag", bagId).Msg("too long span, dropping storage")
 
-					drop()
+					drop(db.StoredBagStopReasonLongSpan)
 					return nil
 				}
 
 				if pi.RatePerMB.Nano().Cmp(s.minRatePerMb.Nano()) < 0 {
 					log.Warn().Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("too low rate per mb in contract, declining storage")
 
-					drop()
+					drop(db.StoredBagStopReasonLowRate)
 					return nil
 				}
 
@@ -388,7 +387,7 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 				// all fees for proofing are 0.05 ton (in most cases), so if bounty is less we will spend more than earn
 				log.Warn().Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("bounty is less than fee, removing torrent")
 
-				drop()
+				drop(db.StoredBagStopReasonLowBounty)
 				return nil
 			}
 
@@ -410,7 +409,7 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 				if deadline < time.Now().Unix() {
 					log.Warn().Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("not enough balance for too long, removing torrent")
 
-					drop()
+					drop(db.StoredBagStopReasonLowBalance)
 				}
 				wait = 30 * time.Second
 				s.mx.Lock()

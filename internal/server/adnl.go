@@ -154,6 +154,7 @@ func (s *Server) handleRLDPQuery(peer *rldp.RLDP) func(transfer []byte, query *r
 				case errors.Is(err, service.ErrTooLongSpan):
 				case errors.Is(err, service.ErrNoSpace):
 				case errors.Is(err, service.ErrTooBigBag):
+				case errors.Is(err, service.ErrProviderRemoved):
 				case isTemporaryProviderError(err):
 					reason = "temporary provider error"
 					log.Debug().Err(err).Str("addr", addr.String()).Msg("temporary provider error")

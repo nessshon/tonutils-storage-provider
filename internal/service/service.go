@@ -91,10 +91,27 @@ func NewService(ton ton.APIClientWrapped, storage Storage, xdb DB, key ed25519.P
 	}
 
 	for _, bag := range bags {
-		if bag.Status != db.StoredBagStatusStopped {
-			go s.bagWorker(address.MustParseAddr(bag.ContractAddr), bag.ContractInfo)
+		if bag.Status == db.StoredBagStatusStopped {
+			continue
 		}
+
+		contractAddr, err := address.ParseAddr(bag.ContractAddr)
+		if err != nil {
+			if stopErr := s.markContractStopped(
+				bag.ContractAddr,
+				bag.BagID,
+				bag.ContractInfo,
+				db.StoredBagStopReasonInvalidContract,
+			); stopErr != nil {
+				return nil, fmt.Errorf("failed to quarantine contract with invalid address %q: %w", bag.ContractAddr, stopErr)
+			}
+			log.Warn().Err(err).Str("addr", bag.ContractAddr).Msg("stored contract has invalid address and was stopped")
+			continue
+		}
+
+		go s.bagWorker(contractAddr, bag.ContractInfo)
 	}
+	s.startStoppedReconciler()
 
 	return s, nil
 }
@@ -111,12 +128,7 @@ func (s *Service) GetStorageInfo(bagSize uint64) (available bool, minSpan, maxSp
 		return
 	}
 
-	spaceAvailable = s.spaceAllocated
-	for _, st := range list {
-		if st.Status == db.StoredBagStatusActive {
-			spaceAvailable -= st.Size
-		}
-	}
+	spaceAvailable = availableStorageSpace(list, s.spaceAllocated)
 
 	if spaceAvailable > s.maxBagSize {
 		spaceAvailable = s.maxBagSize
@@ -157,6 +169,7 @@ var ErrLowBounty = fmt.Errorf("bounty should be at least 0.05 TON to cover fees"
 var ErrTooLowRate = fmt.Errorf("too low rate per mb")
 var ErrNoSpace = fmt.Errorf("not enough free space to store requested bag")
 var ErrTooBigBag = fmt.Errorf("too big bag")
+var ErrProviderRemoved = fmt.Errorf("provider does not exist in this contract")
 
 func (s *Service) FetchStorageInfo(ctx context.Context, contractAddr *address.Address, byteToProof uint64) (*StorageInfo, error) {
 	if !contractAddr.IsBounceable() || contractAddr.IsTestnetOnly() || contractAddr.Workchain() != 0 {
@@ -167,11 +180,9 @@ func (s *Service) FetchStorageInfo(ctx context.Context, contractAddr *address.Ad
 	log.Debug().Str("addr", contractAddr.String()).Msg("received request for bag, checking...")
 
 	bag, err := s.db.GetContract(contractAddr.String())
+	wasStopped := err == nil && bag.Status == db.StoredBagStatusStopped
 	if err == nil {
 		if bag.Status != db.StoredBagStatusStopped {
-			s.mx.Lock()
-			defer s.mx.Unlock()
-
 			// idempotency
 			return s.fetchStorageInfo(ctx, bag, byteToProof, contractAddr.String())
 		}
@@ -212,7 +223,7 @@ func (s *Service) FetchStorageInfo(ctx context.Context, contractAddr *address.Ad
 	pi, contractAvailableBalance, err := contract.GetProviderDataV1(ctx, s.ton, master, contractAddr, s.key.Public().(ed25519.PublicKey))
 	if err != nil {
 		if errors.Is(err, contract.ErrProviderNotFound) {
-			return nil, fmt.Errorf("provider does not exist in this contract: %s", hex.EncodeToString(s.key.Public().(ed25519.PublicKey)))
+			return nil, fmt.Errorf("%w: %s", ErrProviderRemoved, hex.EncodeToString(s.key.Public().(ed25519.PublicKey)))
 		}
 		return nil, fmt.Errorf("failed to run contract method get_provider_info: %w", err)
 	}
@@ -236,55 +247,24 @@ func (s *Service) FetchStorageInfo(ctx context.Context, contractAddr *address.Ad
 		// all fees for proofing are at most 0.05 ton (in most cases), so if bounty is less we will spend more than earn
 		return nil, ErrLowBounty
 	}
+	if wasStopped && contractAvailableBalance.Nano().Cmp(bounty) < 0 {
+		return nil, ErrLowBalance
+	}
 
 	if pi.RatePerMB.Nano().Cmp(s.minRatePerMb.Nano()) < 0 {
 		return nil, ErrTooLowRate
-	}
-
-	if s.spaceAllocated < si.Size {
-		return nil, ErrNoSpace
-	}
-
-	list, err := s.db.ListContracts()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current contracts: %w", err)
-	}
-
-	left := s.spaceAllocated - si.Size
-	for _, st := range list {
-		if st.Status == db.StoredBagStatusActive {
-			if left < st.Size {
-				return nil, ErrNoSpace
-			}
-			left -= st.Size
-		}
-	}
-
-	s.mx.Lock()
-	defer s.mx.Unlock()
-
-	bag, err = s.db.GetContract(contractAddr.String())
-	if err == nil {
-		if bag.Status != db.StoredBagStatusStopped {
-			// idempotency
-			return s.fetchStorageInfo(ctx, bag, byteToProof, contractAddr.String())
-		}
-	}
-	if err != nil && !errors.Is(err, db.ErrNotFound) {
-		return nil, fmt.Errorf("failed to read db: %w", err)
 	}
 
 	info := &db.ContractInfo{
 		MaxSpan: pi.MaxSpan,
 		PerMB:   pi.RatePerMB.Nano().String(),
 	}
-
-	if err = s.db.SetContract(db.StoredBag{
-		ContractAddr: contractAddr.String(),
-		Status:       db.StoredBagStatusAdded,
-		ContractInfo: info,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to add to db: %w", err)
+	bag, shouldStart, err := s.reserveContract(contractAddr.String(), si.TorrentHash, si.Size, info)
+	if err != nil {
+		return nil, err
+	}
+	if !shouldStart {
+		return s.fetchStorageInfo(ctx, bag, byteToProof, contractAddr.String())
 	}
 
 	log.Debug().Str("addr", contractAddr.String()).Msg("contract added for storage")
@@ -318,8 +298,11 @@ func (s *Service) fetchStorageInfo(ctx context.Context, bag db.StoredBag, byteTo
 			status = "resolving"
 		}
 	} else {
-		if w := s.warns[contract]; w != "" {
-			status = "warning-" + w
+		s.mx.RLock()
+		warning := s.warns[contract]
+		s.mx.RUnlock()
+		if warning != "" {
+			status = "warning-" + warning
 		} else {
 			if byteToProof >= b.BagSize {
 				return nil, fmt.Errorf("byte is not exist in the given bag")
