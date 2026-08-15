@@ -240,9 +240,11 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to init service")
 	}
 
-	startWalletStartupScanFlow(cfg, *ConfigPath, lsCfg, svc, w.WalletAddress())
-
+	// server first, so we answer clients and publish our dht record
+	// while the archive node lookup below is still going
 	server.NewServer(dhtClient, gate, cfg.ADNLKey, cfg.ProviderKey, svc, log.Logger.With().Str("source", "server").Logger())
+
+	startWalletStartupScanFlow(cfg, *ConfigPath, lsCfg, svc, w.WalletAddress())
 
 	log.Info().Str("build", GitCommit).Hex("provider_key", cfg.ProviderKey.Public().(ed25519.PublicKey)).Msg("service started")
 
