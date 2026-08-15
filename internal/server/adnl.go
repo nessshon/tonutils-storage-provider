@@ -20,6 +20,10 @@ import (
 	"time"
 )
 
+// minDHTRecordCopies is the number of dht nodes below which our record is
+// considered poorly replicated and clients may fail to resolve us.
+const minDHTRecordCopies = 3
+
 type Service interface {
 	FetchStorageInfo(ctx context.Context, contractAddr *address.Address, byteToProof uint64) (*service.StorageInfo, error)
 	GetStorageInfo(bagSize uint64) (available bool, minSpan, maxSpan uint32, spaceAvailable uint64, ratePerMB tlb.Coins)
@@ -87,8 +91,11 @@ func (s *Server) updateDHT(ctx context.Context) error {
 	ctxStore, cancel := context.WithTimeout(ctx, 90*time.Second)
 	stored, id, err := s.dht.StoreAddress(ctxStore, addr, 30*time.Minute, s.key)
 	cancel()
-	if err != nil && stored == 0 {
-		return fmt.Errorf("failed to store address: %w", err)
+	if stored == 0 {
+		if err != nil {
+			return fmt.Errorf("failed to store address: %w", err)
+		}
+		return fmt.Errorf("address record was not accepted by any dht node")
 	}
 
 	pID := keys.PublicKeyED25519{Key: s.providerKey.Public().(ed25519.PublicKey)}
@@ -102,11 +109,27 @@ func (s *Server) updateDHT(ctx context.Context) error {
 	ctxStore, cancel = context.WithTimeout(ctx, 90*time.Second)
 	stored, id, err = s.dht.Store(ctxStore, pID, []byte("storage-provider"), 0, data, dht.UpdateRuleSignature{}, 30*time.Minute, s.providerKey)
 	cancel()
-	if err != nil && stored == 0 {
-		return fmt.Errorf("failed to store storage-provider record in dht: %w", err)
+	if stored == 0 {
+		if err != nil {
+			return fmt.Errorf("failed to store storage-provider record in dht: %w", err)
+		}
+		return fmt.Errorf("storage-provider record was not accepted by any dht node")
 	}
 
-	s.logger.Debug().Int("nodes", stored).Msg("our address record updated")
+	rt := s.dht.RoutingTableStats()
+	if stored < minDHTRecordCopies {
+		s.logger.Warn().Int("nodes", stored).
+			Int("dht_active", rt.ActiveNodes).
+			Int("dht_backup", rt.BackupNodes).
+			Int("dht_buckets", rt.FilledBuckets).
+			Msg("our record is stored on too few dht nodes, we may be hard to discover")
+	}
+
+	s.logger.Debug().Int("nodes", stored).
+		Int("dht_active", rt.ActiveNodes).
+		Int("dht_backup", rt.BackupNodes).
+		Int("dht_buckets", rt.FilledBuckets).
+		Msg("our address record updated")
 
 	return nil
 }
