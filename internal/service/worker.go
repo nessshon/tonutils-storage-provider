@@ -20,6 +20,22 @@ import (
 	"time"
 )
 
+const (
+	dropRetryInitialDelay = 3 * time.Second
+	dropRetryMaxDelay     = 5 * time.Minute
+	dropRetryAttempts     = 20
+)
+
+func nextDropRetryDelay(prev time.Duration) time.Duration {
+	if prev <= 0 {
+		return dropRetryInitialDelay
+	}
+	if next := prev * 2; next < dropRetryMaxDelay {
+		return next
+	}
+	return dropRetryMaxDelay
+}
+
 // bagUsedByAnotherContract reports a contract that still needs this bag, so it is
 // not removed from storage. Reserved contracts count too, their worker is already
 // running and will download the same data.
@@ -52,7 +68,15 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 		stop()
 
 		wait := time.Duration(0)
-		for {
+		for attempt := 0; ; attempt++ {
+			if attempt >= dropRetryAttempts {
+				// contract stays active in db, so it is retried after restart,
+				// its space stays reserved and no data is lost meanwhile
+				log.Error().Str("addr", contractAddr.String()).Hex("bag", bagId).
+					Str("reason", string(reason)).Msg("failed to stop storage for contract, giving up until restart")
+				return
+			}
+
 			select {
 			case <-s.globalCtx.Done():
 				// want to exit
@@ -103,7 +127,7 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 				return nil
 			}(); err != nil {
 				log.Error().Err(err).Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("failed to set stopped contract to db, will be retried")
-				wait = 3 * time.Second
+				wait = nextDropRetryDelay(wait)
 
 				continue
 			}
