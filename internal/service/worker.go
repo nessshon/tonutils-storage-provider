@@ -20,6 +20,21 @@ import (
 	"time"
 )
 
+// bagUsedByAnotherContract reports a contract that still needs this bag, so it is
+// not removed from storage. Reserved contracts count too, their worker is already
+// running and will download the same data.
+func bagUsedByAnotherContract(list []db.StoredBag, bagID []byte, selfAddr string) string {
+	for _, st := range list {
+		if st.Status != db.StoredBagStatusActive && st.Status != db.StoredBagStatusAdded {
+			continue
+		}
+		if bytes.Equal(st.BagID, bagID) && st.ContractAddr != selfAddr {
+			return st.ContractAddr
+		}
+	}
+	return ""
+}
+
 func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo) {
 	var torrentSize uint64
 	var pieceSize uint32
@@ -49,20 +64,12 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 				ctx, cancel := context.WithTimeout(s.globalCtx, 15*time.Second)
 				defer cancel()
 
-				usedByAnother := ""
 				list, err := s.db.ListContracts()
 				if err != nil {
 					return fmt.Errorf("failed to list contracts from db: %w", err)
 				}
 
-				for _, st := range list {
-					if st.Status == db.StoredBagStatusActive &&
-						bytes.Equal(st.BagID, bagId) && st.ContractAddr != contractAddr.String() {
-						usedByAnother = st.ContractAddr
-						break
-					}
-				}
-
+				usedByAnother := bagUsedByAnotherContract(list, bagId, contractAddr.String())
 				if usedByAnother == "" {
 					bd, err := s.storage.GetBag(ctx, bagId)
 					if err != nil {
