@@ -130,17 +130,12 @@ func (q *TxQueue) send(ctx context.Context, msg *wallet.Message, queued time.Dur
 	return tx.Hash, nil
 }
 
-// resend sends the same message to the next liteserver every interval until stopped
+// resend sends the same message to the next liteserver every interval until stopped,
+// the first send is done by SendExternalMessageWaitTransaction, liteserver rejects the same message twice
 func (q *TxQueue) resend(ctx context.Context, ext *tlb.ExternalMessage, stop <-chan struct{}) (sent, failed int) {
 	cl := q.api.Client()
 	node := cl.StickyContext(ctx)
 	for {
-		sent++
-		if err := q.api.SendExternalMessage(node, ext); err != nil && ctx.Err() == nil {
-			failed++
-			log.Warn().Err(err).Msg("liteserver did not accept external message")
-		}
-
 		select {
 		case <-stop:
 			return
@@ -155,6 +150,12 @@ func (q *TxQueue) resend(ctx context.Context, ext *tlb.ExternalMessage, stop <-c
 			next = cl.StickyContext(ctx)
 		}
 		node = next
+
+		sent++
+		if err := q.api.SendExternalMessage(node, ext); err != nil && ctx.Err() == nil {
+			failed++
+			log.Warn().Err(err).Msg("liteserver did not accept external message")
+		}
 	}
 }
 

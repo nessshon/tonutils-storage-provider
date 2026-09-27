@@ -135,8 +135,9 @@ func TestTxQueue_ResendsSameMessageToNextNodes(t *testing.T) {
 	sends := append([]fakeSend(nil), api.sends...)
 	api.mx.Unlock()
 	for i, s := range sends {
-		if s.node != uint32(i+1) {
-			t.Fatalf("send %d went to node %d, want %d", i, s.node, i+1)
+		// node 1 gets the first send from SendExternalMessageWaitTransaction, resend starts from the next one
+		if s.node != uint32(i+2) {
+			t.Fatalf("send %d went to node %d, want %d", i, s.node, i+2)
 		}
 		if !bytes.Equal(s.hash, hash) {
 			t.Fatal("every send should carry the same message")
