@@ -83,7 +83,7 @@ func NewService(ton ton.APIClientWrapped, storage Storage, xdb DB, key ed25519.P
 	}
 
 	// initialize single-threaded tx queue for wallet operations
-	s.txQueue = NewTxQueue(globalCtx, w)
+	s.txQueue = NewTxQueue(globalCtx, w, ton)
 
 	bags, err := s.db.ListContracts()
 	if err != nil {

@@ -3,7 +3,20 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"github.com/rs/zerolog/log"
+	"github.com/xssnick/tonutils-go/tlb"
+	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/wallet"
+	"time"
+)
+
+const (
+	// equals the wallet message TTL set in NewService, after it the message cannot be included anymore
+	txSendTimeout = 120 * time.Second
+	// liteserver may accept an external message and never relay it, so it goes to the next node every interval,
+	// each node gets it rarely, far below the liteserver per address limit (30 messages per 10 seconds)
+	txResendInterval = time.Second
 )
 
 // TxQueue serializes wallet transactions so they are sent one-by-one from a single goroutine
@@ -20,6 +33,7 @@ import (
 
 type TxQueue struct {
 	w      *wallet.Wallet
+	api    ton.APIClientWrapped
 	reqCh  chan txRequest
 	closed chan struct{}
 }
@@ -28,6 +42,7 @@ type txRequest struct {
 	ctx  context.Context
 	msg  *wallet.Message
 	resp chan txResponse
+	at   time.Time
 }
 
 type txResponse struct {
@@ -37,9 +52,10 @@ type txResponse struct {
 
 // NewTxQueue creates a TxQueue bound to the given wallet and starts a single worker
 // that processes requests sequentially until ctx is cancelled.
-func NewTxQueue(ctx context.Context, w *wallet.Wallet) *TxQueue {
+func NewTxQueue(ctx context.Context, w *wallet.Wallet, api ton.APIClientWrapped) *TxQueue {
 	q := &TxQueue{
 		w:      w,
+		api:    api,
 		reqCh:  make(chan txRequest),
 		closed: make(chan struct{}),
 	}
@@ -63,12 +79,10 @@ func (q *TxQueue) loop(ctx context.Context) {
 				continue
 			}
 
-			tx, _, err := q.w.SendWaitTransaction(req.ctx, req.msg)
-
-			var hash []byte
-			if err == nil && tx != nil {
-				hash = tx.Hash
-			}
+			// time in queue is not counted, each message gets the whole ttl to be included
+			sendCtx, cancel := context.WithTimeout(req.ctx, txSendTimeout)
+			hash, err := q.send(sendCtx, req.msg, time.Since(req.at))
+			cancel()
 
 			select {
 			case req.resp <- txResponse{hash: hash, err: err}:
@@ -78,6 +92,65 @@ func (q *TxQueue) loop(ctx context.Context) {
 				return
 			}
 		}
+	}
+}
+
+func (q *TxQueue) send(ctx context.Context, msg *wallet.Message, queued time.Duration) ([]byte, error) {
+	ext, err := q.w.BuildExternalMessageForMany(ctx, []*wallet.Message{msg})
+	if err != nil {
+		return nil, fmt.Errorf("failed to build external message: %w", err)
+	}
+
+	startedAt := time.Now()
+	var sent, failed int
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		sent, failed = q.resend(ctx, ext, stop)
+	}()
+
+	tx, _, _, err := q.api.SendExternalMessageWaitTransaction(ctx, ext)
+	close(stop)
+	<-done
+
+	l := log.Info()
+	if err != nil {
+		l = log.Warn().Err(err)
+	}
+	l.Hex("msg_hash", ext.NormalizedHash()).Dur("queued", queued).Dur("took", time.Since(startedAt)).
+		Int("sent", sent).Int("failed", failed).Msg("external message send finished")
+
+	if err != nil {
+		return nil, err
+	}
+	return tx.Hash, nil
+}
+
+// resend sends the same message to the next liteserver every interval until stopped
+func (q *TxQueue) resend(ctx context.Context, ext *tlb.ExternalMessage, stop <-chan struct{}) (sent, failed int) {
+	cl := q.api.Client()
+	node := cl.StickyContext(ctx)
+	for {
+		sent++
+		if err := q.api.SendExternalMessage(node, ext); err != nil && ctx.Err() == nil {
+			failed++
+			log.Warn().Err(err).Msg("liteserver did not accept external message")
+		}
+
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		case <-time.After(txResendInterval):
+		}
+
+		next, err := cl.StickyContextNextNode(node)
+		if err != nil {
+			// all nodes were used, go round again
+			next = cl.StickyContext(ctx)
+		}
+		node = next
 	}
 }
 
@@ -104,7 +177,7 @@ func (q *TxQueue) SendWait(ctx context.Context, msg *wallet.Message) ([]byte, er
 		return nil, errors.New("nil wallet message")
 	}
 	respCh := make(chan txResponse, 1)
-	req := txRequest{ctx: ctx, msg: msg, resp: respCh}
+	req := txRequest{ctx: ctx, msg: msg, resp: respCh, at: time.Now()}
 
 	select {
 	case q.reqCh <- req:

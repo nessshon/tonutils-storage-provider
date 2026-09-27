@@ -455,7 +455,8 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 
 					log.Info().Str("bounty_before_fee", tlb.FromNanoTON(bounty).String()).Str("wallet_balance", wBalance.String()).Str("bag_balance", contractAvailableBalance.String()).Uint64("byte", pi.ByteToProof).Hex("bag", bagId).Str("addr", contractAddr.String()).Msg("sending proof to storage contract...")
 
-					hash, err := s.txQueue.SendWait(ctx, wallet.SimpleMessage(contractAddr, tlb.MustFromTON("0.05"), payload))
+					// queue limits the send by itself, iteration timeout would expire while waiting in queue
+					hash, err := s.txQueue.SendWait(stopCtx, wallet.SimpleMessage(contractAddr, tlb.MustFromTON("0.05"), payload))
 					if err != nil {
 						return fmt.Errorf("failed to send piece proof: %w", err)
 					}
