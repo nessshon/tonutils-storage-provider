@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"github.com/rs/zerolog/log"
@@ -101,6 +102,12 @@ func (q *TxQueue) send(ctx context.Context, msg *wallet.Message, queued time.Dur
 		return nil, fmt.Errorf("failed to build external message: %w", err)
 	}
 
+	// signed message while it is still valid, to send or emulate it separately
+	if c, cErr := tlb.ToCell(ext); cErr == nil {
+		log.Info().Hex("msg_hash", ext.NormalizedHash()).Str("boc", base64.StdEncoding.EncodeToString(c.ToBOCWithFlags(false))).
+			Msg("external message built")
+	}
+
 	startedAt := time.Now()
 	var sent, failed int
 	stop, done := make(chan struct{}), make(chan struct{})
@@ -116,10 +123,6 @@ func (q *TxQueue) send(ctx context.Context, msg *wallet.Message, queued time.Dur
 	l := log.Info()
 	if err != nil {
 		l = log.Warn().Err(err)
-		// signed message to emulate it and see why it was not included
-		if c, cErr := tlb.ToCell(ext); cErr == nil {
-			l = l.Hex("boc", c.ToBOCWithFlags(false))
-		}
 	}
 	l.Hex("msg_hash", ext.NormalizedHash()).Dur("queued", queued).Dur("took", time.Since(startedAt)).
 		Int("sent", sent).Int("failed", failed).Msg("external message send finished")
