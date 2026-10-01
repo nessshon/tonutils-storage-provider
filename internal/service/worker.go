@@ -446,6 +446,16 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 
 					proofData, err := s.storage.GetPieceProof(ctx, bagId, pi.ByteToProof/uint64(pieceSize))
 					if err != nil {
+						if errors.Is(err, storage.ErrNotFound) {
+							if _, bagErr := s.storage.GetBag(ctx, bagId); errors.Is(bagErr, storage.ErrNotFound) {
+								log.Warn().Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("bag is not found in storage, downloading it again")
+
+								downloaded, verified = false, false
+								startedAt = time.Now()
+								wait = 0
+								return nil
+							}
+						}
 						return fmt.Errorf("failed to get proof: %w", err)
 					}
 
