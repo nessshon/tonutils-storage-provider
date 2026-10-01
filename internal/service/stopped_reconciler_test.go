@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-storage-provider/internal/db"
@@ -236,6 +237,51 @@ func TestReconcileStoppedContracts_SelectsOnlyRetryableContracts(t *testing.T) {
 	}
 	if !seen[legacyAddr] || !seen[lowBalanceAddr] {
 		t.Fatalf("expected legacy and low-balance contracts, got %v", fetcher.calls)
+	}
+}
+
+func TestStalledRetryDue_BacksOffUpToMaxDelay(t *testing.T) {
+	addr := testContractAddr(16)
+	svc := &Service{}
+	now := time.Now()
+
+	for _, delay := range []time.Duration{30 * time.Minute, time.Hour, 2 * time.Hour, 4 * time.Hour, 4 * time.Hour} {
+		if !svc.stalledRetryDue(addr, now) {
+			t.Fatalf("retry must be due at %v", now)
+		}
+		svc.scheduleStalledRetry(addr, now)
+		if svc.stalledRetryDue(addr, now.Add(delay-time.Second)) {
+			t.Fatalf("retry must wait %v", delay)
+		}
+		now = now.Add(delay)
+	}
+}
+
+func TestReconcileStoppedContracts_BacksOffOnlyResumedStalledDownloads(t *testing.T) {
+	stalledAddr := testContractAddr(17)
+	lowBalanceAddr := testContractAddr(18)
+	xdb := newMemoryContractDB(
+		db.StoredBag{ContractAddr: stalledAddr, Status: db.StoredBagStatusStopped, StopReason: db.StoredBagStopReasonDownloadStalled},
+		db.StoredBag{ContractAddr: lowBalanceAddr, Status: db.StoredBagStatusStopped, StopReason: db.StoredBagStopReasonLowBalance},
+	)
+	svc := &Service{db: xdb}
+	fetcher := &reconcileFetchStub{}
+
+	for _, err := range []error{context.DeadlineExceeded, nil, nil} {
+		fetcher.err = err
+		if err := svc.reconcileStoppedContracts(context.Background(), fetcher, 0); err != nil {
+			t.Fatalf("reconcile failed: %v", err)
+		}
+	}
+
+	fetcher.mx.Lock()
+	defer fetcher.mx.Unlock()
+	calls := map[string]int{}
+	for _, addr := range fetcher.calls {
+		calls[addr]++
+	}
+	if calls[stalledAddr] != 2 || calls[lowBalanceAddr] != 3 {
+		t.Fatalf("expected stalled twice and low balance three times, got %v", calls)
 	}
 }
 

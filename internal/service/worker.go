@@ -305,6 +305,10 @@ func (s *Service) bagWorker(contractAddr *address.Address, info *db.ContractInfo
 
 				log.Info().Str("addr", contractAddr.String()).Hex("bag", bagId).Msg("bag is downloaded")
 
+				s.mx.Lock()
+				delete(s.stalledRetries, contractAddr.String())
+				s.mx.Unlock()
+
 				downloaded = true
 			} else {
 				if startedAt.Before(time.Now().Add(-time.Duration(s.maxMinutesNoProgress) * time.Minute)) {

@@ -15,7 +15,16 @@ const (
 	stoppedReconcileInterval       = 15 * time.Minute
 	stoppedReconcileFetchTimeout   = 30 * time.Second
 	stoppedReconcileRequestSpacing = time.Second
+
+	// each retry reserves space again, so stalled downloads are retried rarer
+	stalledRetryMinDelay = 30 * time.Minute
+	stalledRetryMaxDelay = 4 * time.Hour
 )
+
+type stalledRetry struct {
+	at    time.Time
+	delay time.Duration
+}
 
 var errInvalidStoredContractAddress = errors.New("invalid stored contract address")
 
@@ -60,6 +69,10 @@ func (s *Service) reconcileStoppedContracts(
 			!stoppedReasonRetryable(bag.StopReason) {
 			continue
 		}
+		if bag.StopReason == db.StoredBagStopReasonDownloadStalled &&
+			!s.stalledRetryDue(bag.ContractAddr, time.Now()) {
+			continue
+		}
 
 		if attempted && requestSpacing > 0 {
 			timer := time.NewTimer(requestSpacing)
@@ -97,10 +110,35 @@ func (s *Service) reconcileStoppedContracts(
 			continue
 		}
 
+		if bag.StopReason == db.StoredBagStopReasonDownloadStalled {
+			// failed requests are not attempts
+			s.scheduleStalledRetry(bag.ContractAddr, time.Now())
+		}
 		log.Info().Str("addr", bag.ContractAddr).Msg("stopped storage contract resumed")
 	}
 
 	return nil
+}
+
+func (s *Service) stalledRetryDue(contractAddr string, now time.Time) bool {
+	s.mx.RLock()
+	defer s.mx.RUnlock()
+
+	return !now.Before(s.stalledRetries[contractAddr].at)
+}
+
+func (s *Service) scheduleStalledRetry(contractAddr string, now time.Time) {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
+	if s.stalledRetries == nil {
+		s.stalledRetries = map[string]stalledRetry{}
+	}
+
+	retry := s.stalledRetries[contractAddr]
+	retry.delay = min(max(retry.delay*2, stalledRetryMinDelay), stalledRetryMaxDelay)
+	retry.at = now.Add(retry.delay)
+	s.stalledRetries[contractAddr] = retry
 }
 
 func stoppedReasonRetryable(reason db.StoredBagStopReason) bool {

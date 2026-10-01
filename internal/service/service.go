@@ -55,8 +55,9 @@ type Service struct {
 	globalCtx            context.Context
 	stop                 func()
 
-	warns   map[string]string
-	txQueue *TxQueue
+	warns          map[string]string
+	stalledRetries map[string]stalledRetry
+	txQueue        *TxQueue
 
 	mx sync.RWMutex
 }
